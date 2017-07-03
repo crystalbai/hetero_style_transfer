@@ -1,0 +1,7 @@
+/usr/local/lib/python2.7/dist-packages/matplotlib/font_manager.py:273: UserWarning: Matplotlib is building the font cache using fc-list. This may take a moment.
+  warnings.warn('Matplotlib is building the font cache using fc-list. This may take a moment.')
+style.py:main:10:59:47.260 -- Starting style transfer.
+style.py:main:10:59:50.080 -- Running net on GPU 1.
+style.py:main:10:59:50.176 -- Successfully loaded images.
+style.py:main:10:59:51.406 -- Successfully loaded model googlenet.
+Optimizing:   0% |                                             | ETA:  --:--:--Optimizing:   1% |                                              | ETA:  0:05:45

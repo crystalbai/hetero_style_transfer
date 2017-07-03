@@ -1,0 +1,17 @@
+caffe*/
+.idea/
+*.jpg
+*.png
+*.caffemodel.h5
+*.caffemodel
+*.pyc
+lib*/
+featuremap/
+outputs/
+outputs_seg/
+outputs_seplater/
+outputs_seplayer2/
+!outputs/.gitkeeper
+test/
+models/
+.DS_Store
