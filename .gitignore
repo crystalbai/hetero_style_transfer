@@ -1,7 +1,6 @@
 caffe*/
+output/
 .idea/
-*.jpg
-*.png
 *.caffemodel.h5
 *.caffemodel
 *.pyc
