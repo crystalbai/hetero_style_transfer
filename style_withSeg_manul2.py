@@ -27,16 +27,23 @@ ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
 (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
 SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 """
+import matplotlib
+matplotlib.use('Agg')
+
+import os, sys
+os.environ['GLOG_minloglevel'] = '1' 
 
 # system imports
 import argparse
 import logging
-import os
-import sys
 import timeit
+import _init_paths_mnc
+
+
 
 # library imports
 import caffe
+import cv2
 import numpy as np
 import progressbar as pb
 from scipy.fftpack import ifftn
@@ -46,6 +53,7 @@ from scipy.optimize import minimize
 from skimage import img_as_ubyte
 from skimage.transform import rescale
 
+#os.environ['GLOG_minloglevel'] = '0'
 
 # logging
 LOG_FORMAT = "%(filename)s:%(funcName)s:%(asctime)s.%(msecs)03d -- %(message)s"
@@ -53,6 +61,13 @@ LOG_FORMAT = "%(filename)s:%(funcName)s:%(asctime)s.%(msecs)03d -- %(message)s"
 # numeric constants
 INF = np.float32(np.inf)
 STYLE_SCALE = 1.2
+
+CLASSES = ('aeroplane', 'bicycle', 'bird', 'boat',
+           'bottle', 'bus', 'car', 'cat', 'chair',
+           'cow', 'diningtable', 'dog', 'horse',
+           'motorbike', 'person', 'pottedplant',
+           'sheep', 'sofa', 'train', 'tvmonitor')
+
 
 # weights for the individual models
 # assume that corresponding layers' top blob matches its name
@@ -85,7 +100,8 @@ CAFFENET_WEIGHTS = {"content": {"conv4": 1},
 # argparse
 parser = argparse.ArgumentParser(description="Transfer the style of one image to another.",
                                  usage="style.py -s <style_image> -c <content_image>")
-parser.add_argument("-s", "--style-img", type=str, required=True, help="input style (art) image")
+parser.add_argument("-sb", "--style-bg-img", type=str, required=True, help="input style (art) image")
+parser.add_argument("-sf", "--style-fg-img", type=str, required=True, help="input style (art) image")
 parser.add_argument("-c", "--content-img", type=str, required=True, help="input content image")
 parser.add_argument("-g", "--gpu-id", default=0, type=int, required=False, help="GPU device number")
 parser.add_argument("-m", "--model", default="vgg16", type=str, required=False, help="model to use")
@@ -95,7 +111,80 @@ parser.add_argument("-n", "--num-iters", default=512, type=int, required=False, 
 parser.add_argument("-l", "--length", default=512, type=float, required=False, help="maximum image length")
 parser.add_argument("-v", "--verbose", action="store_true", required=False, help="print minimization outputs")
 parser.add_argument("-o", "--output", default=None, required=False, help="output path")
+parser.add_argument("-mask", "--mask_img", default=None, required=False, help="mask image")
 
+
+def prep_im_for_blob(im, pixel_means, target_size, max_size):
+    """Mean subtract and scale an image for use in a blob."""
+    im = im.astype(np.float32, copy=False)
+    im -= pixel_means
+    im_shape = im.shape
+    im_size_min = np.min(im_shape[0:2])
+    im_size_max = np.max(im_shape[0:2])
+    im_scale = float(target_size) / float(im_size_min)
+    # Prevent the biggest axis from being more than MAX_SIZE
+    if np.round(im_scale * im_size_max) > max_size:
+        im_scale = float(max_size) / float(im_size_max)
+    im = cv2.resize(im, None, None, fx=im_scale, fy=im_scale,
+                    interpolation=cv2.INTER_LINEAR)
+
+    return im, im_scale
+
+pixel_mean = np.array([[[102.9801, 115.9465, 122.7717]]])
+def img_preprocess(img):
+
+    net_in = []
+    img = img.astype(np.float32, copy=True)
+    net_in = img - pixel_mean
+    net_in = net_in.reshape((1,) + net_in.shape)
+    channel_swap = (0, 3, 1, 2)
+    net_in = net_in.transpose(channel_swap)
+    return net_in
+
+def img_deprocess(datablob):
+    img = datablob[0]
+    channel_swap = (1,2,0)
+    img = img.transpose(channel_swap)
+    img = img + pixel_mean
+    return img
+
+
+def get_seg(net,net_in,im):
+
+    # 1. output from phase1'
+    rois_phase1 = net.blobs['rois'].data.copy()
+    masks_phase1 = net.blobs['mask_proposal'].data[...]
+    scores_phase1 = net.blobs['seg_cls_prob'].data[...]
+    # 2. output from phase2
+    rois_phase2 = net.blobs['rois_ext'].data[...]
+    masks_phase2 = net.blobs['mask_proposal_ext'].data[...]
+    scores_phase2 = net.blobs['seg_cls_prob_ext'].data[...]
+    rois_phase1 = rois_phase1[:, 1:5]
+    rois_phase2 = rois_phase2[:, 1:5]
+    rois_phase1, _ = clip_boxes(rois_phase1, im.shape)
+    rois_phase2, _ = clip_boxes(rois_phase2, im.shape)
+    masks = np.concatenate((masks_phase1, masks_phase2), axis=0)
+    boxes = np.concatenate((rois_phase1, rois_phase2), axis=0)
+    scores = np.concatenate((scores_phase1, scores_phase2), axis=0)
+    return masks, boxes, scores
+
+def get_vis_dict(result_box, result_mask, img_name, cls_names, vis_thresh=0.5):
+    box_for_img = []
+    mask_for_img = []
+    cls_for_img = []
+    for cls_ind, cls_name in enumerate(cls_names):
+        det_for_img = result_box[cls_ind]
+        seg_for_img = result_mask[cls_ind]
+        keep_inds = np.where(det_for_img[:, -1] >= vis_thresh)[0]
+        for keep in keep_inds:
+            box_for_img.append(det_for_img[keep])
+            mask_for_img.append(seg_for_img[keep][0])
+            cls_for_img.append(cls_ind + 1)
+    res_dict = {'image_name': img_name,
+                'cls_name': cls_for_img,
+                'boxes': box_for_img,
+                'masks': mask_for_img}
+    return res_dict
 
 def _compute_style_grad(F, G, G_style, layer):
     """
@@ -124,23 +213,35 @@ def _compute_content_grad(F, F_content, layer):
 
     return loss, grad
 
-def _compute_reprs(net_in, net, layers_style, layers_content, gram_scale=1):
+def _compute_reprs(net_in, net, layers_style, layers_content, scaler, mask, gram_scale=1):
     """
         Computes representation matrices for an image.
     """
 
     # input data and forward pass
     (repr_s, repr_c) = ({}, {})
+
     net.blobs["data"].data[0] = net_in
     net.forward()
 
     # loop through combined set of layers
     for layer in set(layers_style)|set(layers_content):
-        F = net.blobs[layer].data[0].copy()
-        F.shape = (F.shape[0], -1)
-        repr_c[layer] = F
-        if layer in layers_style:
-            repr_s[layer] = sgemm(gram_scale, F, F.T)
+        if mask is not None:
+            F = net.blobs[layer].data[0].copy()
+            mask_tmp = cv2.resize(mask[:, :, 0].astype(np.float32), (F.shape[2], F.shape[1]))
+            mask_tmp = np.repeat(mask_tmp[np.newaxis, :, :], F.shape[0], axis=0)
+            F = F*mask_tmp
+            F.shape = (F.shape[0], -1)
+            repr_c[layer] = F
+            if layer in layers_style:
+                repr_s[layer] = sgemm(gram_scale, F, F.T)
+        else:
+            F = net.blobs[layer].data[0].copy()
+            F.shape = (F.shape[0], -1)
+            repr_c[layer] = F
+            if layer in layers_style:
+                repr_s[layer] = sgemm(gram_scale, F, F.T)
+
 
     return repr_s, repr_c
 
@@ -171,10 +272,15 @@ def style_optfn(x, net, weights, layers, reprs, ratio):
     layers_style = weights["style"].keys()
     layers_content = weights["content"].keys()
     net_in = x.reshape(net.blobs["data"].data.shape[1:])
+    net_in = net_in.reshape((1,) + net_in.shape)
 
     # compute representations
-    (G_style, F_content) = reprs
-    (G, F) = _compute_reprs(net_in, net, layers_style, layers_content)
+    (G_style_bg, G_style_fg, F_content, scaler, mask_bg, mask_fg) = reprs
+    G_bg = _compute_reprs(net_in, net, layers_style, layers_content,scaler, mask_bg, 1)[0]
+    G_fg = _compute_reprs(net_in, net, layers_style, layers_content, scaler, mask_fg, 1)[0]
+    F = _compute_reprs(net_in, net, layers_style, layers_content, scaler, None, 1)[1]
+
+
 
     # backprop by layer
     loss = 0
@@ -186,9 +292,19 @@ def style_optfn(x, net, weights, layers, reprs, ratio):
         # style contribution
         if layer in layers_style:
             wl = weights["style"][layer]
-            (l, g) = _compute_style_grad(F, G, G_style, layer)
-            loss += wl * l * ratio
-            grad += wl * g.reshape(grad.shape) * ratio
+            (l_bg, g_bg) = _compute_style_grad(F, G_bg, G_style_bg, layer)
+            (l_fg, g_fg) = _compute_style_grad(F, G_fg, G_style_fg, layer)
+            loss += wl * l_bg * ratio + wl * l_fg * ratio
+
+            grad_bg = g_bg.reshape(grad.shape)
+            mask_bg_grad_tmp = cv2.resize(mask_bg[:, :, 0].astype(np.float32), (grad.shape[2], grad.shape[1]))
+            grad_bg = grad_bg * np.repeat(mask_bg_grad_tmp[np.newaxis, :, :], grad.shape[0], axis=0)
+
+            grad_fg = g_fg.reshape(grad.shape)
+            mask_fg_grad_tmp = cv2.resize(mask_fg[:, :, 0].astype(np.float32), (grad.shape[2], grad.shape[1]))
+            grad_fg = grad_fg * np.repeat(mask_fg_grad_tmp[np.newaxis, :, :], grad.shape[0], axis=0)
+
+            grad += wl * grad_bg * ratio + wl * grad_fg * ratio
 
         # content contribution
         if layer in layers_content:
@@ -304,13 +420,13 @@ class StyleTransfer(object):
         null_fds = os.open(os.devnull, os.O_RDWR)
         out_orig = os.dup(2)
         os.dup2(null_fds, 2)
-        net = caffe.Net(str(model_file), str(pretrained_file), caffe.TEST)
+        net = caffe.Net(model_file, pretrained_file, caffe.TEST)
         os.dup2(out_orig, 2)
         os.close(null_fds)
 
         # all models used are trained on imagenet data
         transformer = caffe.io.Transformer({"data": net.blobs["data"].data.shape})
-        transformer.set_mean("data", np.load(mean_file).mean(1).mean(1))
+        transformer.set_mean("data", np.array([102.9801, 115.9465, 122.7717]))
         transformer.set_channel_swap("data", (2,1,0))
         transformer.set_transpose("data", (2,0,1))
         transformer.set_raw_scale("data", 255)
@@ -328,7 +444,7 @@ class StyleTransfer(object):
         """
 
         data = self.net.blobs["data"].data
-        img_out = self.transformer.deprocess("data", data)
+        img_out = img_deprocess(data)
         return img_out
     
     def _rescale_net(self, img):
@@ -382,7 +498,7 @@ class StyleTransfer(object):
                              " ", pb.ETA()]
         self.pbar.maxval = max_iter
 
-    def transfer_style(self, img_style, img_content, length=512, ratio=1e5,
+    def transfer_style(self, img_style_bg, img_style_fg, img_content, length=512, ratio=1e5,
                        n_iter=512, init="-1", verbose=False, callback=None):
         """
             Transfers the style of the artwork to the input image.
@@ -401,33 +517,57 @@ class StyleTransfer(object):
         orig_dim = min(self.net.blobs["data"].shape[2:])
 
         # rescale the images
-        scale = max(length / float(max(img_style.shape[:2])),
-                    orig_dim / float(min(img_style.shape[:2])))
-        img_style = rescale(img_style, STYLE_SCALE*scale)
-        scale = max(length / float(max(img_content.shape[:2])),
-                    orig_dim / float(min(img_content.shape[:2])))
-        img_content = rescale(img_content, scale)
+        scale_style_bg = max(length / float(max(img_style_bg.shape[:2])),
+                    orig_dim / float(min(img_style_bg.shape[:2])))
+        img_style_bg = rescale(img_style_bg, STYLE_SCALE*scale_style_bg, preserve_range = True)
 
-        # compute style representations
-        self._rescale_net(img_style)
-        layers = self.weights["style"].keys()
-        net_in = self.transformer.preprocess("data", img_style)
-        gram_scale = float(img_content.size)/img_style.size
-        G_style = _compute_reprs(net_in, self.net, layers, [],
-                                 gram_scale=1)[0]
+        scale_style_fg = max(length / float(max(img_style_fg.shape[:2])),
+                          orig_dim / float(min(img_style_fg.shape[:2])))
+        img_style_fg = rescale(img_style_fg, STYLE_SCALE * scale_style_fg, preserve_range=True)
+
+        scale_content = max(length / float(max(img_content.shape[:2])),
+                    orig_dim / float(min(img_content.shape[:2])))
+        img_content = rescale(img_content, scale_content, preserve_range=True)
+
+
 
         # compute content representations
         self._rescale_net(img_content)
         layers = self.weights["content"].keys()
-        net_in = self.transformer.preprocess("data", img_content)
-        F_content = _compute_reprs(net_in, self.net, [], layers)[1]
+        net_in = img_preprocess(img_content)
+        F_content = _compute_reprs(net_in, self.net, [], layers, scale_content, None)[1]
+
+        # get bbox and segmentation information
+
+        mask_fg = cv2.imread(args.mask_img)
+        mask_fg = rescale(mask_fg, scale_content, preserve_range=True)/255
+        
+
+        mask_fg = mask_fg > 0
+        mask_bg = ~mask_fg
+
+        # compute style representations
+        self._rescale_net(img_style_bg)
+        layers = self.weights["style"].keys()
+        net_in = img_preprocess(img_style_bg)
+        gram_scale = float(img_content.size)/img_style_bg.size
+        G_style_bg = _compute_reprs(net_in, self.net, layers, [],
+                                 STYLE_SCALE * scale_style_bg, mask_bg, gram_scale=1)[0]
+        self._rescale_net(img_style_fg)
+        net_in = img_preprocess(img_style_fg)
+        G_style_fg = _compute_reprs(net_in, self.net, layers, [],
+                                    STYLE_SCALE * scale_style_bg, mask_fg, gram_scale=1)[0]
+
+        #rescale back to the content image size
+        self._rescale_net(img_content)
+
 
         # generate initial net input
         # "content" = content image, see kaishengtai/neuralart
         if isinstance(init, np.ndarray):
             img0 = self.transformer.preprocess("data", init)
         elif init == "content":
-            img0 = self.transformer.preprocess("data", img_content)
+            img0 = img_preprocess(img_content)
         elif init == "mixed":
             img0 = 0.95*self.transformer.preprocess("data", img_content) + \
                    0.05*self.transformer.preprocess("data", img_style)
@@ -437,13 +577,16 @@ class StyleTransfer(object):
         # compute data bounds
         data_min = -self.transformer.mean["data"][:,0,0]
         data_max = data_min + self.transformer.raw_scale["data"]
-        data_bounds = [(data_min[0], data_max[0])] * int(img0.size / 3) + \
-                      [(data_min[1], data_max[1])] * int(img0.size / 3) + \
-                      [(data_min[2], data_max[2])] * int(img0.size / 3)
+        data_bounds = [(data_min[0], data_max[0])]*(img0.size/3) + \
+                      [(data_min[1], data_max[1])]*(img0.size/3) + \
+                      [(data_min[2], data_max[2])]*(img0.size/3)
 
         # optimization params
         grad_method = "L-BFGS-B"
-        reprs = (G_style, F_content)
+
+
+
+        reprs = (G_style_bg, G_style_fg, F_content,scale_content, mask_bg, mask_fg)
         minfn_args = {
             "args": (self.net, self.weights, self.layers, reprs, ratio),
             "method": grad_method, "jac": True, "bounds": data_bounds,
@@ -472,8 +615,8 @@ def main(args):
     level = logging.INFO if args.verbose else logging.DEBUG
     logging.basicConfig(format=LOG_FORMAT, datefmt="%H:%M:%S", level=level)
     logging.info("Starting style transfer.")
-
     # set GPU/CPU mode
+
     if args.gpu_id == -1:
         caffe.set_mode_cpu()
         logging.info("Running net on CPU.")
@@ -483,10 +626,13 @@ def main(args):
         logging.info("Running net on GPU {0}.".format(args.gpu_id))
 
     # load images
-    img_style = caffe.io.load_image(args.style_img)
-    img_content = caffe.io.load_image(args.content_img)
+    img_style_bg = cv2.imread(args.style_bg_img)
+    img_style_fg = cv2.imread(args.style_fg_img)
+    img_content = cv2.imread(args.content_img)
     logging.info("Successfully loaded images.")
-    
+    print(img_style_fg.shape)
+    print(img_style_bg.shape)
+    print(img_content.shape)
     # artistic style class
     use_pbar = not args.verbose
     st = StyleTransfer(args.model.lower(), use_pbar=use_pbar)
@@ -494,24 +640,26 @@ def main(args):
 
     # perform style transfer
     start = timeit.default_timer()
-    n_iters = st.transfer_style(img_style, img_content, length=args.length, 
+    n_iters = st.transfer_style(img_style_bg, img_style_fg, img_content, length=args.length,
                                 init=args.init, ratio=np.float(args.ratio), 
                                 n_iter=args.num_iters, verbose=args.verbose)
     end = timeit.default_timer()
     logging.info("Ran {0} iterations in {1:.0f}s.".format(n_iters, end-start))
     img_out = st.get_generated()
-
+    img_out = img_out - img_out.min()
+    img_out = img_out * (255 / (img_out.max() - img_out.min()))
     # output path
     if args.output is not None:
         out_path = args.output
     else:
         out_path_fmt = (os.path.splitext(os.path.split(args.content_img)[1])[0], 
-                        os.path.splitext(os.path.split(args.style_img)[1])[0], 
+                        os.path.splitext(os.path.split(args.style_bg_img)[1])[0],
+                        os.path.splitext(os.path.split(args.style_fg_img)[1])[0],
                         args.model, args.init, args.ratio, args.num_iters)
-        out_path = "outputs/{0}-{1}-{2}-{3}-{4}-{5}.jpg".format(*out_path_fmt)
+        out_path = "output/WithSeg7_{0}-{1}-{2}-{3}-{4}-{5}--{6}.jpg".format(*out_path_fmt)
 
     # DONE!
-    imsave(out_path, img_as_ubyte(img_out))
+    cv2.imwrite(out_path, img_out)
     logging.info("Output saved to {0}.".format(out_path))
 
 
