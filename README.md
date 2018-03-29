@@ -1,4 +1,4 @@
-# style-transfer
+# Heterogeneous style transfer
 
 ## Introduction
 
